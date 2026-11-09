@@ -2,54 +2,66 @@
 
 ## 1. System overview
 
-The initial design has five logical layers:
-
-1. **Web client** — custom HTML/CSS/TypeScript UI; owns user-side encryption and local device state.
-2. **Matrix client layer** — Matrix JavaScript SDK for room messaging, device identities, encryption, sync, and encrypted media workflows.
-3. **DETwal application API** — registration approval, usernames, role checks, group policy, device registry, audit records, and integration with the messaging homeserver.
-4. **Messaging homeserver** — self-hosted Matrix Synapse, configured for private federation policy or disabled federation as appropriate to the product's threat model.
-5. **Storage** — PostgreSQL for application metadata; replaceable encrypted-media storage adapter. Telegram may be evaluated for a prototype only.
+1. **Web client:** React + TypeScript; owns the UI and client-side encryption/device state.
+2. **Identity and account data:** Supabase Auth + PostgreSQL; stores email identity, username, display name, approval status, roles, and device registry metadata.
+3. **DETwal core API:** Rust service; enforces approval, role permissions, group policy, device policy, and controlled Matrix operations. The browser must not be trusted to enforce admin permissions.
+4. **Messaging:** Matrix Synapse + Matrix JavaScript SDK; handles message delivery, device identities, sync, and E2EE.
+5. **Attachment storage:** Telegram may be tested behind a replaceable storage adapter for opaque client-encrypted blobs only. It is not the message transport or source of truth.
+6. **Admin interface:** TypeScript MCP service with narrowly scoped administrative tools; no message-content or key access.
 
 ## 2. Logical flow
 
 ```text
-Browser (DETwal Web)
-  |-- DETwal API: registration, approval state, roles, group policy
-  |-- Matrix SDK: encrypted messages, device verification, sync
+React + TypeScript browser
+  |-- Supabase Auth: sign up, sign in, email verification, reset
+  |-- Rust API: authorized account, group and device operations
+  |-- Matrix JS SDK: E2EE chat and device verification
   |
-DETwal API (Node.js / TypeScript)
-  |-- PostgreSQL
-  |-- Matrix Admin API (server-side, tightly scoped)
-  |-- MCP admin tools (ChatGPT integration)
-  |-- Storage adapter
+Rust DETwal API
+  |-- Supabase Postgres/Auth: identity and policy metadata
+  |-- Matrix Admin API: tightly scoped server operations
+  |-- Telegram storage adapter: encrypted blobs only
   |
-Matrix Synapse ---- PostgreSQL
+Matrix Synapse ---- dedicated Matrix database
   |
-Encrypted media storage adapter
+MCP admin service ---- Rust API (authorization enforced by Rust)
 ```
 
-## 3. Registration and identity
+## 3. Current implementation: authentication foundation
 
-- Users choose a unique DETwal username.
-- Registration starts in `pending` state.
-- An owner or appointed administrator approves or rejects the request.
-- Only approved users receive access to the messaging service.
-- Username uniqueness and authorization are enforced server-side.
-- Do not expose whether a username exists in ways that enable account enumeration.
+The first Supabase migration creates `public.profiles` linked to `auth.users`:
+- `username` (unique, lowercase, 3–24 characters)
+- `display_name`
+- `role`: owner, admin, member (defaults to member)
+- `status`: pending, approved, rejected, suspended (defaults to pending)
+- avatar URL and timestamps
 
-## 4. Roles and group policy
+A database trigger creates a pending profile after Auth signup. Clients cannot insert profiles or change their role/status. RLS restricts profile reads to the profile owner; users can update only display name/avatar. A future Rust service will expose controlled admin lookups and status changes.
+
+The frontend currently includes sign-in, sign-up, forgot/reset password, pending approval, access unavailable, and a protected placeholder app page. It is an early foundation, not a finished chat client.
+
+## 4. Registration and identity
+
+- Users choose a unique DETwal username and register with email/password.
+- Supabase email verification should be enabled.
+- New registrations start as `pending`.
+- Owner/admin approval must happen through a trusted server-side operation.
+- Do not expose account enumeration or allow users to set their own roles/status.
+- Use short-lived sessions and server-side verification for sensitive operations.
+
+## 5. Roles and group policy
 
 Roles: `owner`, `admin`, `member`.
 
 - Owner appoints and revokes administrators.
-- Owner and admins can approve registrations and manage groups.
+- Owner/admin approve or reject registrations and manage groups.
 - Members can message approved users and participate in groups they belong to.
 - Members cannot create groups.
-- Group membership changes are authorized by the DETwal API and reflected in the Matrix room.
-- Every privileged action is checked server-side and written to an append-only audit log.
+- Every privileged action is authorized by Rust API and written to an append-only audit log.
 - MCP is a command interface, never the authorization boundary.
+- Never trust user-editable Auth metadata for authorization.
 
-## 5. Messaging and encryption
+## 6. Messaging and encryption
 
 Use Matrix E2EE via a maintained Matrix client SDK and supported encryption implementation. Do not design a new cryptographic protocol.
 
@@ -60,11 +72,11 @@ Use Matrix E2EE via a maintained Matrix client SDK and supported encryption impl
 - Clearly document metadata that remains visible to the homeserver.
 - Test key backup, recovery, device revocation, and history transfer.
 
-## 6. Multi-device history
+## 7. Multi-device history
 
-A new device creates its own cryptographic identity. It must be verified by an existing trusted device or an explicitly designed recovery flow. Encrypted room keys/history are transferred through the established Matrix secure device/key-backup mechanisms. Never copy plaintext history through the backend. Recovery-key loss can make historical content unrecoverable; explain this to users.
+A new device creates its own cryptographic identity. It must be verified by an existing trusted device or an explicitly designed recovery flow. Encrypted room keys/history are transferred through established Matrix secure device/key-backup mechanisms. Never copy plaintext history through the backend. Recovery-key loss can make historical content unrecoverable; explain this to users.
 
-## 7. ChatGPT / MCP administration
+## 8. ChatGPT / MCP administration
 
 A separate MCP service may expose narrowly scoped tools:
 - list pending registration requests (minimal metadata)
@@ -76,13 +88,13 @@ A separate MCP service may expose narrowly scoped tools:
 - revoke a device
 - inspect administrative audit records
 
-Every tool call must authenticate the acting principal, enforce role checks in the API, validate target IDs, support confirmation for destructive actions, be idempotent where possible, and emit an audit record. MCP must not expose message contents, attachment contents, encryption keys, recovery keys, or session secrets.
+Every tool call must authenticate the acting principal, enforce role checks in Rust API, validate target IDs, support confirmation for destructive actions, be idempotent where possible, and emit an audit record. MCP must not expose message contents, attachment contents, encryption keys, recovery keys, or session secrets.
 
-## 8. Telegram storage experiment
+## 9. Telegram storage experiment
 
 Telegram is not a database, message transport, or cryptographic trust boundary for this product. If evaluated for a prototype:
 - upload only client-encrypted blobs;
-- store opaque object IDs and integrity metadata in DETwal's database;
+- store opaque object IDs and integrity metadata in Supabase;
 - never store keys or plaintext in Telegram;
 - verify current Telegram Bot API limits and applicable terms;
 - implement retries, integrity checks, deletion behavior, and migration;
@@ -90,9 +102,9 @@ Telegram is not a database, message transport, or cryptographic trust boundary f
 
 Do not assume Telegram offers the availability, privacy guarantees, retention, or streaming performance required for production.
 
-## 9. Deployment and operations
+## 10. Deployment and operations
 
-- Keep Matrix Synapse, DETwal API, database, and MCP service on private networks where possible.
+- Keep Matrix Synapse, Rust API, database, and MCP service on private networks where possible.
 - Use TLS for all network connections.
 - Store secrets in a secret manager/environment injection, never in Git.
 - Back up databases and encrypted media metadata; test restoration.
